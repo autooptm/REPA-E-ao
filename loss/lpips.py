@@ -20,6 +20,8 @@ from torchvision import models
 from tqdm import tqdm
 
 
+import ao_opt
+
 _LPIPS_MEAN = [-0.030, -0.088, -0.188]
 _LPIPS_STD = [0.458, 0.448, 0.450]
 
@@ -159,6 +161,13 @@ class vgg16(torch.nn.Module):
                 param.requires_grad = False
 
     def forward(self, X):
+        if ao_opt.ON("opt5"):
+            with torch.autocast("cuda", dtype=torch.float16, enabled=True):
+                out = self._forward_slices(X)
+            return type(out)(*[t.float() for t in out])
+        return self._forward_slices(X)
+
+    def _forward_slices(self, X):
         h = self.slice1(X)
         h_relu1_2 = h
         h = self.slice2(h)

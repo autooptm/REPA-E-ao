@@ -1,0 +1,491 @@
+diff --git a/ao_opt.py b/ao_opt.py
+new file mode 100644
+index 0000000..d32e03d
+--- /dev/null
++++ b/ao_opt.py
+@@ -0,0 +1,59 @@
++import os
++
++_LOSSLESS = ("opt4", "opt12", "opt13", "opt14")
++
++# Every option, ON by default. This exact set is the tree measured end to end.
++_DEFAULT = (
++    "opt1",
++    "opt2",
++    "opt3",
++    "opt4",
++    "opt5",
++    "opt6",
++    "opt7",
++    "opt8",
++    "opt9",
++    "opt10",
++    "opt11",
++    "opt12",
++    "opt13",
++    "opt14",
++    "opt15",
++)
++
++_OFF = ("off", "0", "no", "none", "stock", "false")
++
++
++def _resolve():
++    raw = (os.environ.get("AO_OPT") or "").strip()
++    if raw == "":
++        return set(_DEFAULT)
++    low = raw.lower()
++    if low in _OFF:
++        return set()
++    if low == "lossless":
++        return set(_LOSSLESS)
++    if low in ("all", "default", "on"):
++        return set(_DEFAULT)
++    toks = [t.strip() for t in raw.split(",") if t.strip()]
++    if all(t.startswith("-") for t in toks):
++        return set(_DEFAULT) - {t[1:] for t in toks}
++    return {t for t in toks if not t.startswith("-")} - {t[1:] for t in toks if t.startswith("-")}
++
++
++_ACTIVE = _resolve()
++
++
++def ON(token):
++    return token in _ACTIVE
++
++
++def active():
++    return sorted(_ACTIVE)
++
++
++def banner():
++    a = active()
++    return ("[autooptm] AO_OPT: " + (",".join(a) if a else "off (stock path)")
++            + "   (AO_OPT=off for the original code, AO_OPT=lossless for the "
++              "exact subset)")
+diff --git a/loss/discriminator.py b/loss/discriminator.py
+index fb07ceb..b1bde32 100644
+--- a/loss/discriminator.py
++++ b/loss/discriminator.py
+@@ -10,6 +10,9 @@ import torch
+ import torch.nn as nn
+ 
+ 
++import ao_opt
++
++
+ class ActNorm(nn.Module):
+     def __init__(self, num_features, logdet=False, affine=True,
+                  allow_reverse_init=False):
+@@ -154,4 +157,8 @@ class NLayerDiscriminator(nn.Module):
+ 
+     def forward(self, input):
+         """Standard forward."""
++        if ao_opt.ON("opt6"):
++            with torch.autocast("cuda", dtype=torch.float16, enabled=True):
++                out = self.main(input)
++            return out.float()
+         return self.main(input)
+diff --git a/loss/losses.py b/loss/losses.py
+index 565915a..56fe777 100644
+--- a/loss/losses.py
++++ b/loss/losses.py
+@@ -24,6 +24,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from einops import rearrange
+ from torch.cuda.amp import autocast
++import ao_opt
+ from .perceptual_loss import PerceptualLoss
+ from .discriminator import NLayerDiscriminator, weights_init
+ 
+@@ -247,7 +248,10 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
+         for param in self.discriminator.parameters():
+             param.requires_grad = True
+ 
+-        real_images = inputs.detach().requires_grad_(True)
++        if ao_opt.ON("opt13"):
++            real_images = inputs.detach()
++        else:
++            real_images = inputs.detach().requires_grad_(True)
+         logits_real = self.discriminator(real_images)
+         logits_fake = self.discriminator(reconstructions.detach())
+ 
+@@ -301,8 +305,13 @@ class ReconstructionLoss_Single_Stage(ReconstructionLoss_Stage2):
+                            global_step: int
+                            ) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
+         """Generator training step."""
+-        inputs = inputs.contiguous()
+-        reconstructions = reconstructions.contiguous()
++        if ao_opt.ON("opt9"):
++            inputs = inputs.contiguous(memory_format=torch.channels_last)
++            reconstructions = reconstructions.contiguous(
++                memory_format=torch.channels_last)
++        else:
++            inputs = inputs.contiguous()
++            reconstructions = reconstructions.contiguous()
+         if self.reconstruction_loss == "l1":
+             reconstruction_loss = F.l1_loss(inputs, reconstructions, reduction="mean")
+         elif self.reconstruction_loss == "l2":
+diff --git a/loss/lpips.py b/loss/lpips.py
+index 7e6bccf..6a10309 100644
+--- a/loss/lpips.py
++++ b/loss/lpips.py
+@@ -20,6 +20,8 @@ from torchvision import models
+ from tqdm import tqdm
+ 
+ 
++import ao_opt
++
+ _LPIPS_MEAN = [-0.030, -0.088, -0.188]
+ _LPIPS_STD = [0.458, 0.448, 0.450]
+ 
+@@ -159,6 +161,13 @@ class vgg16(torch.nn.Module):
+                 param.requires_grad = False
+ 
+     def forward(self, X):
++        if ao_opt.ON("opt5"):
++            with torch.autocast("cuda", dtype=torch.float16, enabled=True):
++                out = self._forward_slices(X)
++            return type(out)(*[t.float() for t in out])
++        return self._forward_slices(X)
++
++    def _forward_slices(self, X):
+         h = self.slice1(X)
+         h_relu1_2 = h
+         h = self.slice2(h)
+diff --git a/models/autoencoder.py b/models/autoencoder.py
+index 2ceb100..16fc5de 100644
+--- a/models/autoencoder.py
++++ b/models/autoencoder.py
+@@ -9,6 +9,9 @@ import torch
+ import torch.nn as nn
+ 
+ 
++import ao_opt
++
++
+ def nonlinearity(x):
+     # swish
+     return x * torch.sigmoid(x)
+@@ -20,16 +23,53 @@ def Normalize(in_channels, num_groups=32):
+     )
+ 
+ 
++_OPT_3 = {0: (2,), 1: (1, 2), 2: (0, 1), 3: (0,)}
++
++
++def _opt_1(w):
++    out_c, in_c = w.shape[0], w.shape[1]
++    wt = w.new_zeros((in_c, out_c, 4, 4))
++    for kh in range(4):
++        for kw in range(4):
++            acc = 0.0
++            for a in _OPT_3[kh]:
++                for b in _OPT_3[kw]:
++                    acc = acc + w[:, :, a, b]
++            wt[:, :, kh, kw] = acc.transpose(0, 1)
++    return wt
++
++
++def opt_2(module):
++    n = 0
++    for m in module.modules():
++        if isinstance(m, Upsample) and m.with_conv and getattr(m, "_opt_7", None) is None:
++            src = m.conv
++            dec = torch.nn.ConvTranspose2d(src.in_channels, src.out_channels,
++                                           kernel_size=4, stride=2, padding=1,
++                                           device=src.weight.device,
++                                           dtype=src.weight.dtype)
++            with torch.no_grad():
++                dec.weight.copy_(_opt_1(src.weight.data))
++                dec.bias.copy_(src.bias.data)
++            m._opt_7 = dec
++            del m.conv
++            n += 1
++    return n
++
++
+ class Upsample(nn.Module):
+     def __init__(self, in_channels, with_conv):
+         super().__init__()
+         self.with_conv = with_conv
++        self._opt_7 = None
+         if self.with_conv:
+             self.conv = torch.nn.Conv2d(
+                 in_channels, in_channels, kernel_size=3, stride=1, padding=1
+             )
+ 
+     def forward(self, x):
++        if self._opt_7 is not None:
++            return self._opt_7(x)
+         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+         if self.with_conv:
+             x = self.conv(x)
+@@ -136,6 +176,17 @@ class AttnBlock(nn.Module):
+         )
+ 
+     def forward(self, x):
++        if ao_opt.ON("opt15"):
++            h_ = self.norm(x)
++            q, k, v = self.q(h_), self.k(h_), self.v(h_)
++            b, c, h, w = q.shape
++            q = q.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
++            k = k.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
++            v = v.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
++            o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
++            o = o.squeeze(1).transpose(1, 2).reshape(b, c, h, w)
++            return x + self.proj_out(o)
++
+         h_ = x
+         h_ = self.norm(h_)
+         q = self.q(h_)
+diff --git a/models/sit.py b/models/sit.py
+index 50a4ae2..67e0048 100644
+--- a/models/sit.py
++++ b/models/sit.py
+@@ -11,6 +11,7 @@ import torch.nn as nn
+ import numpy as np
+ import math
+ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
++import ao_opt
+ 
+ 
+ def mean_flat(x):
+@@ -369,14 +370,22 @@ class SiT(nn.Module):
+         # loss computation
+         denoising_loss = None if loss_kwargs["align_only"] else mean_flat((x - model_target) ** 2)
+ 
+-        proj_loss = torch.tensor(0., device=x.device)
+-        bsz = zs[0].shape[0]
+-        for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
+-            for z_j, z_tilde_j in zip(z, z_tilde):
+-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
+-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
+-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
+-        proj_loss /= (len(zs) * bsz)
++        if ao_opt.ON("opt12"):
++            nrm = torch.nn.functional.normalize
++            proj_loss = None
++            for z, z_tilde in zip(zs, zs_tilde):
++                term = -(nrm(z_tilde, dim=-1) * nrm(z, dim=-1)).sum(dim=-1)
++                proj_loss = term if proj_loss is None else proj_loss + term
++            proj_loss = proj_loss / len(zs)
++        else:
++            proj_loss = torch.tensor(0., device=x.device)
++            bsz = zs[0].shape[0]
++            for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
++                for z_j, z_tilde_j in zip(z, z_tilde):
++                    z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
++                    z_j = torch.nn.functional.normalize(z_j, dim=-1)
++                    proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
++            proj_loss /= (len(zs) * bsz)
+ 
+         return {
+             "zs_tilde": zs_tilde,
+diff --git a/train_repae.py b/train_repae.py
+index 4f25cd3..c244536 100644
+--- a/train_repae.py
++++ b/train_repae.py
+@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
+ from omegaconf import OmegaConf
+ import wandb
+ 
++import ao_opt
+ from dataset import CustomINH5Dataset
+ from loss.losses import ReconstructionLoss_Single_Stage
+ from models.autoencoder import vae_models
+@@ -27,12 +28,33 @@ from samplers import euler_sampler
+ from utils import load_encoders, normalize_latents, denormalize_latents, preprocess_imgs_vae, count_trainable_params
+ 
+ logger = get_logger(__name__)
++print(ao_opt.banner())
+ 
+ CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
+ CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
+ 
+ 
++_DINO_MS = {}
++
++
++def _opt_8(x):
++    resolution = x.shape[-1]
++    x = x / 255.0
++    x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode="bicubic")
++    key = (x.device, x.dtype)
++    ms = _DINO_MS.get(key)
++    if ms is None:
++        mean = torch.tensor(IMAGENET_DEFAULT_MEAN, device=x.device,
++                            dtype=x.dtype).view(1, -1, 1, 1)
++        std = torch.tensor(IMAGENET_DEFAULT_STD, device=x.device,
++                           dtype=x.dtype).view(1, -1, 1, 1)
++        ms = _DINO_MS[key] = (mean, std)
++    return (x - ms[0]) / ms[1]
++
++
+ def preprocess_raw_image(x, enc_type):
++    if "dinov2" in enc_type and ao_opt.ON("opt10"):
++        return _opt_8(x)
+     resolution = x.shape[-1]
+     if 'clip' in enc_type:
+         x = x / 255.
+@@ -172,6 +194,9 @@ def main(args):
+         encoders, encoder_types, architectures = load_encoders(
+             args.enc_type, device, args.resolution
+         )
++        if ao_opt.ON("opt7"):
++            for _enc in encoders:
++                _enc.half()
+     else:
+         raise NotImplementedError()
+     z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
+@@ -222,13 +247,36 @@ def main(args):
+         torch.backends.cuda.matmul.allow_tf32 = True
+         torch.backends.cudnn.allow_tf32 = True
+ 
++    if ao_opt.ON("opt3"):
++        torch.backends.cudnn.benchmark = True
++
++    if ao_opt.ON("opt9"):
++        _opt_5 = 0
++        for _mod in (vae, vae_loss_fn):
++            for _t in list(_mod.parameters()) + list(_mod.buffers()):
++                if _t.dim() == 4:
++                    _t.data = _t.data.contiguous(memory_format=torch.channels_last)
++                    _opt_5 += 1
++        assert _opt_5 > 0, "[autooptm] opt9: no tensor converted"
++
++    if ao_opt.ON("opt11"):
++        globals()["update_ema"] = torch.compile(update_ema)
++
++    if ao_opt.ON("opt8"):
++        from models.autoencoder import opt_2
++        # after load_state_dict, so the transposed weight comes from the TRAINED conv
++        _opt_6 = opt_2(vae)
++        assert _opt_6 > 0, "[autooptm] opt8: no Upsample block changed"
++
+     # Define the optimizers for SiT, VAE, and VAE loss function separately
++    _opt_4 = True if ao_opt.ON("opt4") else None
+     optimizer = torch.optim.AdamW(
+         model.parameters(),
+         lr=args.learning_rate,
+         betas=(args.adam_beta1, args.adam_beta2),
+         weight_decay=args.adam_weight_decay,
+         eps=args.adam_epsilon,
++        fused=_opt_4,
+     )
+     optimizer_vae = torch.optim.AdamW(
+         vae.parameters(),
+@@ -236,6 +284,7 @@ def main(args):
+         betas=(args.adam_beta1, args.adam_beta2),
+         weight_decay=args.adam_weight_decay,
+         eps=args.adam_epsilon,
++        fused=_opt_4,
+     )
+     optimizer_loss_fn = torch.optim.AdamW(
+         vae_loss_fn.parameters(),
+@@ -243,6 +292,7 @@ def main(args):
+         betas=(args.adam_beta1, args.adam_beta2),
+         weight_decay=args.adam_weight_decay,
+         eps=args.adam_epsilon,
++        fused=_opt_4,
+     )
+ 
+     # Setup data
+@@ -294,6 +344,17 @@ def main(args):
+     # Allow larger cache size for DYNAMo compilation
+     torch._dynamo.config.cache_size_limit = 64
+     torch._dynamo.config.accumulated_cache_size_limit = 512
++    if ao_opt.ON("opt1"):
++        from models.autoencoder import ResnetBlock
++        from models.sit import SiTBlock
++        SiTBlock.forward = torch.compile(SiTBlock.forward)
++        ResnetBlock.forward = torch.compile(ResnetBlock.forward)
++    if ao_opt.ON("opt2"):
++        from loss.discriminator import NLayerDiscriminator
++        from loss.lpips import vgg16
++        vgg16.forward = torch.compile(vgg16.forward)
++        NLayerDiscriminator.forward = torch.compile(NLayerDiscriminator.forward)
++
+     # Model compilation for better performance
+     if args.compile:
+         model = torch.compile(model, backend="inductor", mode="default")
+@@ -442,28 +503,36 @@ def main(args):
+                 global_step += 1
+ 
+                 # Prepare the logs based on the current step
+-                logs = {
+-                    "sit_loss": accelerator.gather(sit_loss).mean().detach().item(), 
+-                    "denoising_loss": accelerator.gather(sit_outputs["denoising_loss"]).mean().detach().item(),
+-                    "proj_loss": accelerator.gather(sit_outputs["proj_loss"]).mean().detach().item(),
+-                    "grad_norm_sit": accelerator.gather(grad_norm_sit).mean().detach().item(),
+-                    "epoch": epoch,
+-                    "vae_loss": accelerator.gather(vae_loss).mean().detach().item(),
+-                    "reconstruction_loss": accelerator.gather(vae_loss_dict["reconstruction_loss"].mean()).mean().detach().item(),
+-                    "perceptual_loss": accelerator.gather(vae_loss_dict["perceptual_loss"].mean()).mean().detach().item(),
+-                    "kl_loss": accelerator.gather(vae_loss_dict["kl_loss"].mean()).mean().detach().item(),
+-                    "weighted_gan_loss": accelerator.gather(vae_loss_dict["weighted_gan_loss"].mean()).mean().detach().item(),
+-                    "discriminator_factor": accelerator.gather(vae_loss_dict["discriminator_factor"].mean()).mean().detach().item(),
+-                    "gan_loss": accelerator.gather(vae_loss_dict["gan_loss"].mean()).mean().detach().item(),
+-                    "d_weight": accelerator.gather(vae_loss_dict["d_weight"].mean()).mean().detach().item(),
+-                    "grad_norm_vae": accelerator.gather(grad_norm_vae).mean().detach().item(),
+-                    "vae_align_loss": accelerator.gather(vae_align_outputs["proj_loss"].mean()).mean().detach().item(),
+-                    "d_loss": accelerator.gather(d_loss).mean().detach().item(),
+-                    "grad_norm_disc": accelerator.gather(grad_norm_disc).mean().detach().item(),
+-                    "logits_real": accelerator.gather(d_loss_dict["logits_real"].mean()).mean().detach().item(),
+-                    "logits_fake": accelerator.gather(d_loss_dict["logits_fake"].mean()).mean().detach().item(),
+-                    "lecam_loss": accelerator.gather(d_loss_dict["lecam_loss"].mean()).mean().detach().item(),
+-                }
++                _log_tensors = (
++                    ("sit_loss", sit_loss),
++                    ("denoising_loss", sit_outputs["denoising_loss"]),
++                    ("proj_loss", sit_outputs["proj_loss"]),
++                    ("grad_norm_sit", grad_norm_sit),
++                    ("vae_loss", vae_loss),
++                    ("reconstruction_loss", vae_loss_dict["reconstruction_loss"]),
++                    ("perceptual_loss", vae_loss_dict["perceptual_loss"]),
++                    ("kl_loss", vae_loss_dict["kl_loss"]),
++                    ("weighted_gan_loss", vae_loss_dict["weighted_gan_loss"]),
++                    ("discriminator_factor", vae_loss_dict["discriminator_factor"]),
++                    ("gan_loss", vae_loss_dict["gan_loss"]),
++                    ("d_weight", vae_loss_dict["d_weight"]),
++                    ("grad_norm_vae", grad_norm_vae),
++                    ("vae_align_loss", vae_align_outputs["proj_loss"]),
++                    ("d_loss", d_loss),
++                    ("grad_norm_disc", grad_norm_disc),
++                    ("logits_real", d_loss_dict["logits_real"]),
++                    ("logits_fake", d_loss_dict["logits_fake"]),
++                    ("lecam_loss", d_loss_dict["lecam_loss"]),
++                )
++                if ao_opt.ON("opt14") and accelerator.num_processes == 1:
++                    _vals = torch.stack([t.detach().float().mean().reshape(())
++                                         for _, t in _log_tensors]).cpu().tolist()
++                    logs = {name: v for (name, _), v in zip(_log_tensors, _vals)}
++                    logs["epoch"] = epoch
++                else:
++                    logs = {name: accelerator.gather(t).mean().detach().item()
++                            for name, t in _log_tensors}
++                    logs["epoch"] = epoch
+                 progress_bar.set_postfix(**logs)
+                 accelerator.log(logs, step=global_step)
+ 
+diff --git a/utils.py b/utils.py
+index 58ab921..51b6df9 100644
+--- a/utils.py
++++ b/utils.py
+@@ -207,9 +207,15 @@ def center_crop_arr(image_arr, image_size):
+     return arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size]
+ 
+ 
++import ao_opt
++
++
+ def preprocess_imgs_vae(imgs):
+     # imgs: (B, C, H, W) -> (B, C, H, W), [0, 255] uint8 -> [-1, 1] float32
+-    return imgs.float() / 127.5 - 1.
++    out = imgs.float() / 127.5 - 1.
++    if ao_opt.ON("opt9"):
++        out = out.contiguous(memory_format=torch.channels_last)
++    return out
+ 
+ 
+ def count_trainable_params(m):

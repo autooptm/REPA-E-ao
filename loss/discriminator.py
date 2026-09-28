@@ -10,6 +10,9 @@ import torch
 import torch.nn as nn
 
 
+import ao_opt
+
+
 class ActNorm(nn.Module):
     def __init__(self, num_features, logdet=False, affine=True,
                  allow_reverse_init=False):
@@ -154,4 +157,8 @@ class NLayerDiscriminator(nn.Module):
 
     def forward(self, input):
         """Standard forward."""
+        if ao_opt.ON("opt6"):
+            with torch.autocast("cuda", dtype=torch.float16, enabled=True):
+                out = self.main(input)
+            return out.float()
         return self.main(input)

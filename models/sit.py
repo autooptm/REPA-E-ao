@@ -11,6 +11,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import ao_opt
 
 
 def mean_flat(x):
@@ -369,14 +370,22 @@ class SiT(nn.Module):
         # loss computation
         denoising_loss = None if loss_kwargs["align_only"] else mean_flat((x - model_target) ** 2)
 
-        proj_loss = torch.tensor(0., device=x.device)
-        bsz = zs[0].shape[0]
-        for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
-            for z_j, z_tilde_j in zip(z, z_tilde):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-        proj_loss /= (len(zs) * bsz)
+        if ao_opt.ON("opt12"):
+            nrm = torch.nn.functional.normalize
+            proj_loss = None
+            for z, z_tilde in zip(zs, zs_tilde):
+                term = -(nrm(z_tilde, dim=-1) * nrm(z, dim=-1)).sum(dim=-1)
+                proj_loss = term if proj_loss is None else proj_loss + term
+            proj_loss = proj_loss / len(zs)
+        else:
+            proj_loss = torch.tensor(0., device=x.device)
+            bsz = zs[0].shape[0]
+            for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
+                for z_j, z_tilde_j in zip(z, z_tilde):
+                    z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
+                    z_j = torch.nn.functional.normalize(z_j, dim=-1)
+                    proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
+            proj_loss /= (len(zs) * bsz)
 
         return {
             "zs_tilde": zs_tilde,

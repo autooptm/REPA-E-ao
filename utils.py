@@ -207,9 +207,15 @@ def center_crop_arr(image_arr, image_size):
     return arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size]
 
 
+import ao_opt
+
+
 def preprocess_imgs_vae(imgs):
     # imgs: (B, C, H, W) -> (B, C, H, W), [0, 255] uint8 -> [-1, 1] float32
-    return imgs.float() / 127.5 - 1.
+    out = imgs.float() / 127.5 - 1.
+    if ao_opt.ON("opt9"):
+        out = out.contiguous(memory_format=torch.channels_last)
+    return out
 
 
 def count_trainable_params(m):

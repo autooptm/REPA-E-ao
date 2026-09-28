@@ -9,6 +9,9 @@ import torch
 import torch.nn as nn
 
 
+import ao_opt
+
+
 def nonlinearity(x):
     # swish
     return x * torch.sigmoid(x)
@@ -20,16 +23,53 @@ def Normalize(in_channels, num_groups=32):
     )
 
 
+_OPT_3 = {0: (2,), 1: (1, 2), 2: (0, 1), 3: (0,)}
+
+
+def _opt_1(w):
+    out_c, in_c = w.shape[0], w.shape[1]
+    wt = w.new_zeros((in_c, out_c, 4, 4))
+    for kh in range(4):
+        for kw in range(4):
+            acc = 0.0
+            for a in _OPT_3[kh]:
+                for b in _OPT_3[kw]:
+                    acc = acc + w[:, :, a, b]
+            wt[:, :, kh, kw] = acc.transpose(0, 1)
+    return wt
+
+
+def opt_2(module):
+    n = 0
+    for m in module.modules():
+        if isinstance(m, Upsample) and m.with_conv and getattr(m, "_opt_7", None) is None:
+            src = m.conv
+            dec = torch.nn.ConvTranspose2d(src.in_channels, src.out_channels,
+                                           kernel_size=4, stride=2, padding=1,
+                                           device=src.weight.device,
+                                           dtype=src.weight.dtype)
+            with torch.no_grad():
+                dec.weight.copy_(_opt_1(src.weight.data))
+                dec.bias.copy_(src.bias.data)
+            m._opt_7 = dec
+            del m.conv
+            n += 1
+    return n
+
+
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
+        self._opt_7 = None
         if self.with_conv:
             self.conv = torch.nn.Conv2d(
                 in_channels, in_channels, kernel_size=3, stride=1, padding=1
             )
 
     def forward(self, x):
+        if self._opt_7 is not None:
+            return self._opt_7(x)
         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
         if self.with_conv:
             x = self.conv(x)
@@ -136,6 +176,17 @@ class AttnBlock(nn.Module):
         )
 
     def forward(self, x):
+        if ao_opt.ON("opt15"):
+            h_ = self.norm(x)
+            q, k, v = self.q(h_), self.k(h_), self.v(h_)
+            b, c, h, w = q.shape
+            q = q.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
+            k = k.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
+            v = v.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
+            o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            o = o.squeeze(1).transpose(1, 2).reshape(b, c, h, w)
+            return x + self.proj_out(o)
+
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)

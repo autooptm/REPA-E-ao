@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.cuda.amp import autocast
+import ao_opt
 from .perceptual_loss import PerceptualLoss
 from .discriminator import NLayerDiscriminator, weights_init
 
@@ -247,7 +248,10 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         for param in self.discriminator.parameters():
             param.requires_grad = True
 
-        real_images = inputs.detach().requires_grad_(True)
+        if ao_opt.ON("opt13"):
+            real_images = inputs.detach()
+        else:
+            real_images = inputs.detach().requires_grad_(True)
         logits_real = self.discriminator(real_images)
         logits_fake = self.discriminator(reconstructions.detach())
 
@@ -301,8 +305,13 @@ class ReconstructionLoss_Single_Stage(ReconstructionLoss_Stage2):
                            global_step: int
                            ) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
         """Generator training step."""
-        inputs = inputs.contiguous()
-        reconstructions = reconstructions.contiguous()
+        if ao_opt.ON("opt9"):
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
+            reconstructions = reconstructions.contiguous(
+                memory_format=torch.channels_last)
+        else:
+            inputs = inputs.contiguous()
+            reconstructions = reconstructions.contiguous()
         if self.reconstruction_loss == "l1":
             reconstruction_loss = F.l1_loss(inputs, reconstructions, reduction="mean")
         elif self.reconstruction_loss == "l2":

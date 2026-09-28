@@ -1,3 +1,75 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>REPA-E · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.65x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.65x-2ea44f"></a>
+    <a href="https://github.com/End2End-Diffusion/REPA-E/commit/2ad4e9f69234c109497fb41d3e5e555de7b4b0de"><img alt="base" src="https://img.shields.io/badge/upstream-2ad4e9f69234-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%205090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [End2End-Diffusion/REPA-E](https://github.com/End2End-Diffusion/REPA-E) at commit
+> [`2ad4e9f69234`](https://github.com/End2End-Diffusion/REPA-E/commit/2ad4e9f69234c109497fb41d3e5e555de7b4b0de) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python train_repae.py --exp-name=ao-sitb2-sdvae --output-dir=exps --report-to=tensorboard --max-train-steps=100 --checkpointing-steps=100000 --sampling-steps=100000 --allow-tf32 --mixed-precision=fp16 --seed=0 --data-dir=data --batch-size=4 --num-workers=4 --path-type=linear --prediction=v --weighting=uniform --model=SiT-B/2 --loss-cfg-path=configs/l1_lpips_kl_gan.yaml --vae=f8d4 --vae-ckpt=pretrained/sdvae/sdvae-f8d4.pt --disc-pretrained-ckpt=pretrained/sdvae/sdvae-f8d4-discriminator-ckpt.pt --enc-type=dinov2-vit-b --proj-coeff=0.5 --encoder-depth=8 --vae-align-proj-coeff=1.5 --bn-momentum=0.1 --no-compile` |
+| **Entry point** | `train_repae.py` |
+| **Unit measured** | one REPA-E training step at 256×256 (SiT-B/2 + SD-VAE f8d4 + DINOv2-B: VAE, discriminator and SiT updates under the command's fp16 mixed precision), batch 4. The run was specified at `--batch-size=32`, which needs ~110 GB of activations and does not fit the 32 GB card, so every number here is at `--batch-size=4` |
+| **Before (stock)** | 214.3 ms per unit (6.91 s for 31 timed steps) |
+| **After (this tree, all switches default ON)** | 129.7 ms per unit (4.20 s for 31 timed steps; a one-time warm-up of ~40 s when the process starts, 9 s for stock, is not included) |
+| **Speedup** | **1.65x** end to end on RTX 5090, noise floor of the host 3.4% |
+| **Output** | per-step loss within 0.9% (relative) of the stock step on the same batches, inside the 2% the command's own `--mixed-precision=fp16` already moves it; gradients stay inside the stock program's own run-to-run spread on this card |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `train_repae.py` | main() -- model setup | 1.318x |
+| `train_repae.py` | main() -- optimizer setup | 1.083x |
+| `train_repae.py` | main() -- backend setup | 1.077x |
+| `train_repae.py` | _opt_8 / preprocess_raw_image | 1.057x |
+| `train_repae.py` | main() -- encoder setup | 1.033x |
+| `train_repae.py` | main() -- per-step logging | 1.024x |
+| `train_repae.py` | main() -- EMA update | 1.009x |
+| `train_repae.py` | main() -- loss-module setup | 1.009x |
+| `train_repae.py` | main() -- model and batch setup | 0.904x |
+| `models/sit.py` | SiT.forward -- projection loss | 1.05x |
+| `models/autoencoder.py` | Upsample | 1.03x |
+| `models/autoencoder.py` | AttnBlock.forward | 1.02x |
+| `loss/lpips.py` | vgg16.forward | 1.054x |
+| `loss/losses.py` | ReconstructionLoss_Stage2._forward_discriminator | 1.037x |
+| `loss/losses.py` | ReconstructionLoss_Single_Stage._forward_generator | 0.904x |
+| `loss/discriminator.py` | module imports | 1.033x |
+| `utils.py` | preprocess_imgs_vae | 0.904x |
+| `ao_opt.py` | new module (added by this fork) | 1.0x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/REPA-E-ao.git
+cd REPA-E-ao
+# set up exactly as upstream documents (data in data/, the SD-VAE checkpoints in pretrained/sdvae/), then:
+python train_repae.py --exp-name=ao-sitb2-sdvae --output-dir=exps --report-to=tensorboard --max-train-steps=100 --checkpointing-steps=100000 --sampling-steps=100000 --allow-tf32 --mixed-precision=fp16 --seed=0 --data-dir=data --batch-size=4 --num-workers=4 --path-type=linear --prediction=v --weighting=uniform --model=SiT-B/2 --loss-cfg-path=configs/l1_lpips_kl_gan.yaml --vae=f8d4 --vae-ckpt=pretrained/sdvae/sdvae-f8d4.pt --disc-pretrained-ckpt=pretrained/sdvae/sdvae-f8d4-discriminator-ckpt.pt --enc-type=dinov2-vit-b --proj-coeff=0.5 --encoder-depth=8 --vae-align-proj-coeff=1.5 --bn-momentum=0.1 --no-compile
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 2ad4e9f69234` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <h1 align="center"> REPA-E: Unlocking VAE for End-to-End Tuning of Latent Diffusion Transformers </h1>
 
 <p align="center">

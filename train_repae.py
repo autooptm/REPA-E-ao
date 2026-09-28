@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 import wandb
 
+import ao_opt
 from dataset import CustomINH5Dataset
 from loss.losses import ReconstructionLoss_Single_Stage
 from models.autoencoder import vae_models
@@ -27,12 +28,33 @@ from samplers import euler_sampler
 from utils import load_encoders, normalize_latents, denormalize_latents, preprocess_imgs_vae, count_trainable_params
 
 logger = get_logger(__name__)
+print(ao_opt.banner())
 
 CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
+_DINO_MS = {}
+
+
+def _opt_8(x):
+    resolution = x.shape[-1]
+    x = x / 255.0
+    x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode="bicubic")
+    key = (x.device, x.dtype)
+    ms = _DINO_MS.get(key)
+    if ms is None:
+        mean = torch.tensor(IMAGENET_DEFAULT_MEAN, device=x.device,
+                            dtype=x.dtype).view(1, -1, 1, 1)
+        std = torch.tensor(IMAGENET_DEFAULT_STD, device=x.device,
+                           dtype=x.dtype).view(1, -1, 1, 1)
+        ms = _DINO_MS[key] = (mean, std)
+    return (x - ms[0]) / ms[1]
+
+
 def preprocess_raw_image(x, enc_type):
+    if "dinov2" in enc_type and ao_opt.ON("opt10"):
+        return _opt_8(x)
     resolution = x.shape[-1]
     if 'clip' in enc_type:
         x = x / 255.
@@ -172,6 +194,9 @@ def main(args):
         encoders, encoder_types, architectures = load_encoders(
             args.enc_type, device, args.resolution
         )
+        if ao_opt.ON("opt7"):
+            for _enc in encoders:
+                _enc.half()
     else:
         raise NotImplementedError()
     z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
@@ -222,13 +247,36 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    if ao_opt.ON("opt3"):
+        torch.backends.cudnn.benchmark = True
+
+    if ao_opt.ON("opt9"):
+        _opt_5 = 0
+        for _mod in (vae, vae_loss_fn):
+            for _t in list(_mod.parameters()) + list(_mod.buffers()):
+                if _t.dim() == 4:
+                    _t.data = _t.data.contiguous(memory_format=torch.channels_last)
+                    _opt_5 += 1
+        assert _opt_5 > 0, "[autooptm] opt9: no tensor converted"
+
+    if ao_opt.ON("opt11"):
+        globals()["update_ema"] = torch.compile(update_ema)
+
+    if ao_opt.ON("opt8"):
+        from models.autoencoder import opt_2
+        # after load_state_dict, so the transposed weight comes from the TRAINED conv
+        _opt_6 = opt_2(vae)
+        assert _opt_6 > 0, "[autooptm] opt8: no Upsample block changed"
+
     # Define the optimizers for SiT, VAE, and VAE loss function separately
+    _opt_4 = True if ao_opt.ON("opt4") else None
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
+        fused=_opt_4,
     )
     optimizer_vae = torch.optim.AdamW(
         vae.parameters(),
@@ -236,6 +284,7 @@ def main(args):
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
+        fused=_opt_4,
     )
     optimizer_loss_fn = torch.optim.AdamW(
         vae_loss_fn.parameters(),
@@ -243,6 +292,7 @@ def main(args):
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
+        fused=_opt_4,
     )
 
     # Setup data
@@ -294,6 +344,17 @@ def main(args):
     # Allow larger cache size for DYNAMo compilation
     torch._dynamo.config.cache_size_limit = 64
     torch._dynamo.config.accumulated_cache_size_limit = 512
+    if ao_opt.ON("opt1"):
+        from models.autoencoder import ResnetBlock
+        from models.sit import SiTBlock
+        SiTBlock.forward = torch.compile(SiTBlock.forward)
+        ResnetBlock.forward = torch.compile(ResnetBlock.forward)
+    if ao_opt.ON("opt2"):
+        from loss.discriminator import NLayerDiscriminator
+        from loss.lpips import vgg16
+        vgg16.forward = torch.compile(vgg16.forward)
+        NLayerDiscriminator.forward = torch.compile(NLayerDiscriminator.forward)
+
     # Model compilation for better performance
     if args.compile:
         model = torch.compile(model, backend="inductor", mode="default")
@@ -442,28 +503,36 @@ def main(args):
                 global_step += 1
 
                 # Prepare the logs based on the current step
-                logs = {
-                    "sit_loss": accelerator.gather(sit_loss).mean().detach().item(), 
-                    "denoising_loss": accelerator.gather(sit_outputs["denoising_loss"]).mean().detach().item(),
-                    "proj_loss": accelerator.gather(sit_outputs["proj_loss"]).mean().detach().item(),
-                    "grad_norm_sit": accelerator.gather(grad_norm_sit).mean().detach().item(),
-                    "epoch": epoch,
-                    "vae_loss": accelerator.gather(vae_loss).mean().detach().item(),
-                    "reconstruction_loss": accelerator.gather(vae_loss_dict["reconstruction_loss"].mean()).mean().detach().item(),
-                    "perceptual_loss": accelerator.gather(vae_loss_dict["perceptual_loss"].mean()).mean().detach().item(),
-                    "kl_loss": accelerator.gather(vae_loss_dict["kl_loss"].mean()).mean().detach().item(),
-                    "weighted_gan_loss": accelerator.gather(vae_loss_dict["weighted_gan_loss"].mean()).mean().detach().item(),
-                    "discriminator_factor": accelerator.gather(vae_loss_dict["discriminator_factor"].mean()).mean().detach().item(),
-                    "gan_loss": accelerator.gather(vae_loss_dict["gan_loss"].mean()).mean().detach().item(),
-                    "d_weight": accelerator.gather(vae_loss_dict["d_weight"].mean()).mean().detach().item(),
-                    "grad_norm_vae": accelerator.gather(grad_norm_vae).mean().detach().item(),
-                    "vae_align_loss": accelerator.gather(vae_align_outputs["proj_loss"].mean()).mean().detach().item(),
-                    "d_loss": accelerator.gather(d_loss).mean().detach().item(),
-                    "grad_norm_disc": accelerator.gather(grad_norm_disc).mean().detach().item(),
-                    "logits_real": accelerator.gather(d_loss_dict["logits_real"].mean()).mean().detach().item(),
-                    "logits_fake": accelerator.gather(d_loss_dict["logits_fake"].mean()).mean().detach().item(),
-                    "lecam_loss": accelerator.gather(d_loss_dict["lecam_loss"].mean()).mean().detach().item(),
-                }
+                _log_tensors = (
+                    ("sit_loss", sit_loss),
+                    ("denoising_loss", sit_outputs["denoising_loss"]),
+                    ("proj_loss", sit_outputs["proj_loss"]),
+                    ("grad_norm_sit", grad_norm_sit),
+                    ("vae_loss", vae_loss),
+                    ("reconstruction_loss", vae_loss_dict["reconstruction_loss"]),
+                    ("perceptual_loss", vae_loss_dict["perceptual_loss"]),
+                    ("kl_loss", vae_loss_dict["kl_loss"]),
+                    ("weighted_gan_loss", vae_loss_dict["weighted_gan_loss"]),
+                    ("discriminator_factor", vae_loss_dict["discriminator_factor"]),
+                    ("gan_loss", vae_loss_dict["gan_loss"]),
+                    ("d_weight", vae_loss_dict["d_weight"]),
+                    ("grad_norm_vae", grad_norm_vae),
+                    ("vae_align_loss", vae_align_outputs["proj_loss"]),
+                    ("d_loss", d_loss),
+                    ("grad_norm_disc", grad_norm_disc),
+                    ("logits_real", d_loss_dict["logits_real"]),
+                    ("logits_fake", d_loss_dict["logits_fake"]),
+                    ("lecam_loss", d_loss_dict["lecam_loss"]),
+                )
+                if ao_opt.ON("opt14") and accelerator.num_processes == 1:
+                    _vals = torch.stack([t.detach().float().mean().reshape(())
+                                         for _, t in _log_tensors]).cpu().tolist()
+                    logs = {name: v for (name, _), v in zip(_log_tensors, _vals)}
+                    logs["epoch"] = epoch
+                else:
+                    logs = {name: accelerator.gather(t).mean().detach().item()
+                            for name, t in _log_tensors}
+                    logs["epoch"] = epoch
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
